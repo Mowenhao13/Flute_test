@@ -8,12 +8,12 @@ type Oti struct {
 }
 
 
-func NewNoCode(encodingSymbolLength, maximumSourceBlockLength uint16) Oti {
+func NewNoCode(encodingSymbolLength uint16) Oti {
 	return Oti{
 		FECEncodingID: 0,
 		FECInstanceID: 0,
 		EncodingSymbolLength:    encodingSymbolLength,
-		MaximumSourceBlockLength: maximumSourceBlockLength,
+		MaximumSourceBlockLength: 0,
 	}
 }
 

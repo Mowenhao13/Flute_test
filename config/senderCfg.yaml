@@ -1,0 +1,29 @@
+static_arp:
+  enable: false
+  interface: eth0
+  peer_ip: 192.168.1.103
+  peer_mac: "00:11:22:33:44:55"
+
+network:
+  source_ip: 192.168.1.102
+  dest_ip: 192.168.1.103
+  port: 3400
+
+transmission:
+  fdt_duration_ms: 1000
+  fdt_start_id: 1
+
+files:
+  - path: ./cmd/send_files/test_1mb.bin
+    name: test_1mb.bin
+    content_type: application/octet-stream
+  - path: ./cmd/send_files/test_100mb.bin
+    name: test_100mb.bin
+    content_type: application/octet-stream
+  # - path: ./cmd/send_files/test_1024mb.bin
+  #   name: test_1024mb.bin
+  #   content_type: application/octet-stream
+
+fec:
+  type: no-code 
+  encoding_symbol_length: 10240

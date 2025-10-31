@@ -11,8 +11,8 @@ def calculate_md5(file_path):
 
 def main():
     # 目录路径
-    send_files_dir = "flute_sender/send_files"
-    received_files_dir = "flute_receiver/received_files"
+    send_files_dir = "cmd/send_files"
+    received_files_dir = "cmd/received_files"
 
     print("MD5 hashes for files in send_files (sender):")
     if os.path.exists(send_files_dir):

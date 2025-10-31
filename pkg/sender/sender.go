@@ -3,25 +3,21 @@ package sender
 import (
 	alc "FluteTest/pkg/alc"
 	fdt "FluteTest/pkg/fdt"
+	fd "FluteTest/pkg/filedesc"
 	lct "FluteTest/pkg/lct"
 	oti "FluteTest/pkg/oti"
-	endpoint "FluteTest/pkg/udpendpoint"
 	"fmt"
 	"math"
-	"math/rand"
 	"net"
-	"os"
 	"time"
 
 	raptorq "github.com/xssnick/raptorq"
 )
 
 type SenderConfig struct {
-	FdtDuration     time.Duration
-	FdtCarouselMode uint8
-	FdtStartID      uint32
-	ToiMaxLength    uint64
-	SymbolSize      uint32
+	FdtDuration time.Duration
+	SymbolSize  uint32
+	FdtStartID  uint32
 }
 
 type FileConfig struct {
@@ -31,24 +27,48 @@ type FileConfig struct {
 }
 
 type Sender struct {
-	EndPoint     endpoint.Endpoint
+	Conn         *net.UDPConn
 	Fdt          fdt.ExtFDT
 	TSI          uint32
 	OTI          oti.Oti
 	SenderConfig SenderConfig
 	FileConfig   FileConfig
 	RQ           raptorq.RaptorQ
+	nextFdtID    uint32
+	nextTSI      uint32
 }
 
-func NewSender(ep endpoint.Endpoint, fdt fdt.ExtFDT, TSI uint32, oti oti.Oti, fileCfg FileConfig, sendCfg SenderConfig, rq *raptorq.RaptorQ) *Sender {
+func NewSender(conn *net.UDPConn, fdtMeta *fdt.ExtFDT, TSI uint32, oti oti.Oti, fileCfg *FileConfig, sendCfg SenderConfig, rq *raptorq.RaptorQ) *Sender {
+	var meta fdt.ExtFDT
+	if fdtMeta != nil {
+		meta = *fdtMeta
+	}
+
+	var cfg FileConfig
+	if fileCfg != nil {
+		cfg = *fileCfg
+	}
+
+	var encoder raptorq.RaptorQ
+	if rq != nil {
+		encoder = *rq
+	}
+
+	startID := sendCfg.FdtStartID
+	if startID == 0 {
+		startID = 1
+	}
+
 	return &Sender{
-		EndPoint:     ep,
-		Fdt:          fdt,
+		Conn:         conn,
+		Fdt:          meta,
 		TSI:          TSI,
 		OTI:          oti,
-		RQ:           *rq,
-		FileConfig:   fileCfg,
 		SenderConfig: sendCfg,
+		FileConfig:   cfg,
+		RQ:           encoder,
+		nextFdtID:    startID,
+		nextTSI:      TSI,
 	}
 }
 
@@ -63,32 +83,37 @@ func (s *Sender) Encode(data []byte) ([]byte, error) {
 	return raw, nil
 }
 
-func (s *Sender) Send() error {
-	destIP := net.ParseIP(s.EndPoint.DestAddr)
-	if destIP == nil {
-		return fmt.Errorf("invalid destination IP: %s", s.EndPoint.DestAddr)
-	}
-	remoteAddr := &net.UDPAddr{IP: destIP, Port: s.EndPoint.Port}
+func AddFile(s *Sender, filedesc *fd.FileDesc) {
+	// 设置 senderCfg symbolSize
+	s.SenderConfig.SymbolSize = uint32(s.OTI.EncodingSymbolLength)
 
-	var localAddr *net.UDPAddr
-	if s.EndPoint.SourceAddr != "" {
-		ip := net.ParseIP(s.EndPoint.SourceAddr)
-		if ip == nil {
-			return fmt.Errorf("invalid source IP: %s", s.EndPoint.SourceAddr)
-		}
-		localAddr = &net.UDPAddr{IP: ip}
+	if filedesc.FdtID == 0 {
+		filedesc.FdtID = s.nextFdtID
+		s.nextFdtID++
+	} else if filedesc.FdtID >= s.nextFdtID {
+		s.nextFdtID = filedesc.FdtID + 1
 	}
 
-	conn, err := net.DialUDP("udp", localAddr, remoteAddr)
-	if err != nil {
-		return fmt.Errorf("dial UDP failed: %w", err)
-	}
-	defer conn.Close()
+	s.TSI = s.nextTSI
+	s.nextTSI++
 
-	fileData, err := os.ReadFile(s.FileConfig.FilePath)
-	if err != nil {
-		fmt.Println("Read file failed:", err)
-		return err
+	// 设置 sender fileCfg
+	fileCfg := s.FileConfig
+	fileCfg.FileName = filedesc.Name
+	fileCfg.FilePath = filedesc.Path
+	fileCfg.ContentType = filedesc.ContentType
+	s.FileConfig = fileCfg
+
+	// 设置 FDT
+	s.Fdt.FileName = filedesc.Name
+	s.Fdt.ContentType = filedesc.ContentType
+	s.Fdt.FDTInstanceID = filedesc.FdtID
+}
+
+func (s *Sender) Send(fileData *[]byte) error {
+
+	if s.Conn == nil {
+		return fmt.Errorf("sender UDP connection is nil")
 	}
 
 	startTime := time.Now()
@@ -96,44 +121,46 @@ func (s *Sender) Send() error {
 
 	oti := s.OTI
 
+	// 是否进行 FEC 编码
 	shouldEncode := (oti.FECEncodingID != 0)
 
-	// 生成 TSI
-	rand.Seed(time.Now().UnixNano())
 	var cci uint8 = 0
 	var tsi uint32 = s.TSI
-	var toi uint32 = 1
+	var toi uint32 = s.Fdt.FDTInstanceID
 
 	fdtDur := s.SenderConfig.FdtDuration
 
-	ChunkSize := int(oti.EncodingSymbolLength)
-	totalChunks := uint32(math.Ceil(float64(len(fileData)) / float64(ChunkSize)))
+	ChunkSize := int(s.SenderConfig.SymbolSize)
+	if ChunkSize <= 0 {
+		return fmt.Errorf("invalid symbol size: %d", ChunkSize)
+	}
+	totalChunks := uint32(math.Ceil(float64(len(*fileData)) / float64(ChunkSize)))
 
 	sendCloseSession := false
 
 	// Send chunks
-	for i := 0; i < len(fileData); i += ChunkSize {
+	for i := 0; i < len(*fileData); i += ChunkSize {
 		serverTime := time.Now()
 		end := i + ChunkSize
-		if end > len(fileData) {
-			end = len(fileData)
+		if end > len(*fileData) {
+			end = len(*fileData)
 		}
-		chunkData := fileData[i:end]
+		chunkData := (*fileData)[i:end]
 		chunkLen := uint32(len(chunkData))
 
-		isLastChunk := (end == len(fileData))
+		isLastChunk := (end == len(*fileData))
 		closeObject := isLastChunk
 		closeSession := false
 
 		data := chunkData
-		cp := uint8(0)
+		cp := uint8(0) // 0: 原始数据 No-code
 		if shouldEncode {
 			encodedSymbol, err := s.Encode(chunkData)
 			if err != nil {
 				return fmt.Errorf("encode chunk data failed: %w", err)
 			}
 			data = encodedSymbol
-			cp = 1
+			cp = 1 // 1: 编码数据 RaptorQ
 		}
 
 		lcth := lct.LCTHeader{
@@ -150,11 +177,7 @@ func (s *Sender) Send() error {
 		fmt.Printf("LCT Header param: Flags(%d), CCI(%d), TSI(%d), TOI(%d)\n", lcth.Flags, lcth.CCI, lcth.TSI, lcth.TOI)
 
 		// FDT
-		fdt := fdt.ExtFDT{
-			FDTInstanceID: 1,
-			ContentType:   s.FileConfig.ContentType,
-			FileName:      s.FileConfig.FileName,
-		}
+		packetFDT := s.Fdt
 
 		// Create ALC packet
 		pkt := &alc.AlcPkt{
@@ -167,7 +190,7 @@ func (s *Sender) Send() error {
 			PayloadLength:   chunkLen,
 			TransferLength:  uint64(len(data)),
 			ServerTime:      serverTime,
-			FDT:             fdt,
+			FDT:             packetFDT,
 		}
 
 		// 日志输出
@@ -180,7 +203,7 @@ func (s *Sender) Send() error {
 			continue
 		}
 
-		_, err := conn.Write(packet)
+		_, err := s.Conn.Write(packet)
 		if err != nil {
 			fmt.Println("Write to UDP failed:", err)
 			return err
@@ -195,7 +218,7 @@ func (s *Sender) Send() error {
 
 	if sendCloseSession {
 		closePkt := alc.NewAlcPktCloseSession(oti, cci, tsi, toi)
-		_, err := conn.Write(closePkt)
+		_, err := s.Conn.Write(closePkt)
 		if err != nil {
 			fmt.Println("Write close packet to UDP failed:", err)
 			return err
@@ -212,27 +235,6 @@ func (s *Sender) SendFDT() error {
 	if err != nil {
 		return fmt.Errorf("marshal FDT failed: %w", err)
 	}
-
-	destIP := net.ParseIP(s.EndPoint.DestAddr)
-	if destIP == nil {
-		return fmt.Errorf("invalid destination IP: %s", s.EndPoint.DestAddr)
-	}
-	remoteAddr := &net.UDPAddr{IP: destIP, Port: s.EndPoint.Port}
-
-	var localAddr *net.UDPAddr
-	if s.EndPoint.SourceAddr != "" {
-		ip := net.ParseIP(s.EndPoint.SourceAddr)
-		if ip == nil {
-			return fmt.Errorf("invalid source IP: %s", s.EndPoint.SourceAddr)
-		}
-		localAddr = &net.UDPAddr{IP: ip}
-	}
-
-	conn, err := net.DialUDP("udp", localAddr, remoteAddr)
-	if err != nil {
-		return fmt.Errorf("dial UDP failed: %w", err)
-	}
-	defer conn.Close()
 
 	fdtAlcPkt := alc.AlcPkt{
 		LCTHeader: lct.LCTHeader{
@@ -256,7 +258,7 @@ func (s *Sender) SendFDT() error {
 	}
 
 	packet := fdtAlcPkt.Serialize()
-	if _, err := conn.Write(packet); err != nil {
+	if _, err := s.Conn.Write(packet); err != nil {
 		return fmt.Errorf("send FDT packet failed: %w", err)
 	}
 

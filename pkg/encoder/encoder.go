@@ -15,6 +15,7 @@ func calculateMD5(data []byte) string {
 	return hex.EncodeToString(hash[:])
 }
 
+
 func main() {
 	// Read file to send
 	filePath := "/home/Halllo/Projects/flute_test/flute_sender/send_files/test_1mb.bin"
