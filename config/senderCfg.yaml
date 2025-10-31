@@ -20,9 +20,6 @@ files:
   - path: ./cmd/send_files/test_100mb.bin
     name: test_100mb.bin
     content_type: application/octet-stream
-  # - path: ./cmd/send_files/test_1024mb.bin
-  #   name: test_1024mb.bin
-  #   content_type: application/octet-stream
 
 fec:
   type: no-code 
